@@ -157,6 +157,110 @@ public struct Magistral3ProcessorConfiguration: Codable, Sendable {
     }
 }
 
+// MARK: - Wrapper Classes for MLX Module Weight Loading
+
+// Linear wrapper that exposes weight/bias with @ModuleInfo for weight loading
+private final class LinearWrapper: Module, UnaryLayer {
+    @ModuleInfo var weight: MLXArray
+    @ModuleInfo var bias: MLXArray?
+
+    init(_ inputDimensions: Int, _ outputDimensions: Int, bias: Bool = true) {
+        let scale = sqrt(1.0 / Float(inputDimensions))
+        self._weight.wrappedValue = MLXRandom.uniform(
+            low: -scale,
+            high: scale,
+            [outputDimensions, inputDimensions]
+        )
+        if bias {
+            self._bias.wrappedValue = MLXRandom.uniform(
+                low: -scale,
+                high: scale,
+                [outputDimensions]
+            )
+        }
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var result = matmul(x, weight.T)
+        if let bias {
+            result = result + bias
+        }
+        return result
+    }
+}
+
+// Conv2d wrapper that exposes weight/bias with @ModuleInfo for weight loading
+private final class Conv2dWrapper: Module, UnaryLayer {
+    @ModuleInfo var weight: MLXArray
+    @ModuleInfo var bias: MLXArray?
+    let padding: (Int, Int)
+    let stride: (Int, Int)
+    let dilation: (Int, Int)
+    let groups: Int
+
+    init(
+        inputChannels: Int,
+        outputChannels: Int,
+        kernelSize: IntOrPair,
+        stride: IntOrPair = 1,
+        padding: IntOrPair = 0,
+        dilation: IntOrPair = 1,
+        groups: Int = 1,
+        bias: Bool = true
+    ) {
+        let kernelSize = kernelSize.values
+        let stride = stride.values
+        let padding = padding.values
+        let dilation = dilation.values
+
+        let scale = sqrt(1.0 / Float(inputChannels * kernelSize.0 * kernelSize.1))
+        self._weight.wrappedValue = MLXRandom.uniform(
+            low: -scale,
+            high: scale,
+            [outputChannels, kernelSize.0, kernelSize.1, inputChannels / groups]
+        )
+
+        if bias {
+            self._bias.wrappedValue = MLXRandom.uniform(
+                low: -scale,
+                high: scale,
+                [outputChannels]
+            )
+        }
+
+        self.padding = padding
+        self.stride = stride
+        self.dilation = dilation
+        self.groups = groups
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var y = conv2d(
+            x, weight, stride: .init(stride), padding: .init(padding), dilation: .init(dilation), groups: groups)
+        if let bias {
+            y = y + bias
+        }
+        return y
+    }
+}
+
+// RMSNorm wrapper that exposes weight with @ModuleInfo for weight loading
+private final class RMSNormWrapper: Module, UnaryLayer {
+    @ModuleInfo var weight: MLXArray
+    let eps: Float
+
+    init(dimensions: Int, eps: Float = 1e-5) {
+        self.eps = eps
+        self._weight.wrappedValue = MLXArray.ones([dimensions])
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let norm = x * rsqrt(x.square().mean(axis: -1, keepDims: true) + eps)
+        let output = norm.asType(Float32.self).asType(x.dtype)
+        return weight * output
+    }
+}
+
 // MARK: - Vision Model Components
 
 private enum Vision {
@@ -243,10 +347,10 @@ private enum Vision {
         let headDim: Int
         let scale: Float
 
-        @ModuleInfo(key: "q_proj") var qProj: Linear
-        @ModuleInfo(key: "k_proj") var kProj: Linear
-        @ModuleInfo(key: "v_proj") var vProj: Linear
-        @ModuleInfo(key: "o_proj") var oProj: Linear
+        @ModuleInfo(key: "q_proj") var qProj: LinearWrapper
+        @ModuleInfo(key: "k_proj") var kProj: LinearWrapper
+        @ModuleInfo(key: "v_proj") var vProj: LinearWrapper
+        @ModuleInfo(key: "o_proj") var oProj: LinearWrapper
 
         init(config: Magistral3Configuration.VisionConfiguration) {
             self.numHeads = config.numAttentionHeads
@@ -254,10 +358,10 @@ private enum Vision {
             self.scale = pow(Float(headDim), -0.5)
 
             let dim = config.hiddenSize
-            self._qProj.wrappedValue = Linear(dim, numHeads * headDim, bias: true)
-            self._kProj.wrappedValue = Linear(dim, numHeads * headDim, bias: true)
-            self._vProj.wrappedValue = Linear(dim, numHeads * headDim, bias: true)
-            self._oProj.wrappedValue = Linear(numHeads * headDim, dim, bias: true)
+            self._qProj.wrappedValue = LinearWrapper(dim, numHeads * headDim, bias: false)
+            self._kProj.wrappedValue = LinearWrapper(dim, numHeads * headDim, bias: false)
+            self._vProj.wrappedValue = LinearWrapper(dim, numHeads * headDim, bias: false)
+            self._oProj.wrappedValue = LinearWrapper(numHeads * headDim, dim, bias: false)
         }
 
         func callAsFunction(_ x: MLXArray, rotaryPosEmb: MLXArray) -> MLXArray {
@@ -289,33 +393,35 @@ private enum Vision {
         }
     }
 
-    // Vision MLP module
+    // Vision MLP module - gated architecture
     final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "fc1") var fc1: Linear
-        @ModuleInfo(key: "fc2") var fc2: Linear
+        @ModuleInfo(key: "gate_proj") var gateProj: LinearWrapper
+        @ModuleInfo(key: "up_proj") var upProj: LinearWrapper
+        @ModuleInfo(key: "down_proj") var downProj: LinearWrapper
 
         init(config: Magistral3Configuration.VisionConfiguration) {
-            self._fc1.wrappedValue = Linear(config.hiddenSize, config.intermediateSize, bias: true)
-            self._fc2.wrappedValue = Linear(config.intermediateSize, config.hiddenSize, bias: true)
+            self._gateProj.wrappedValue = LinearWrapper(config.hiddenSize, config.intermediateSize, bias: false)
+            self._upProj.wrappedValue = LinearWrapper(config.hiddenSize, config.intermediateSize, bias: false)
+            self._downProj.wrappedValue = LinearWrapper(config.intermediateSize, config.hiddenSize, bias: false)
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            fc2(silu(fc1(x)))
+            downProj(silu(gateProj(x)) * upProj(x))
         }
     }
 
     // Vision transformer block
     final class EncoderLayer: Module {
-        @ModuleInfo(key: "self_attn") var attention: Attention
-        @ModuleInfo(key: "mlp") var mlp: MLP
-        @ModuleInfo(key: "input_layernorm") var inputLayerNorm: LayerNorm
-        @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: LayerNorm
+        @ModuleInfo(key: "attention") var attention: Attention
+        @ModuleInfo(key: "feed_forward") var mlp: MLP
+        @ModuleInfo(key: "attention_norm") var inputLayerNorm: RMSNormWrapper
+        @ModuleInfo(key: "ffn_norm") var postAttentionLayerNorm: RMSNormWrapper
 
         init(config: Magistral3Configuration.VisionConfiguration) {
             self._attention.wrappedValue = Attention(config: config)
             self._mlp.wrappedValue = MLP(config: config)
-            self._inputLayerNorm.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-5)
-            self._postAttentionLayerNorm.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-5)
+            self._inputLayerNorm.wrappedValue = RMSNormWrapper(dimensions: config.hiddenSize, eps: 1e-5)
+            self._postAttentionLayerNorm.wrappedValue = RMSNormWrapper(dimensions: config.hiddenSize, eps: 1e-5)
         }
 
         func callAsFunction(_ x: MLXArray, rotaryPosEmb: MLXArray) -> MLXArray {
@@ -325,11 +431,22 @@ private enum Vision {
         }
     }
 
+    // Transformer wrapper for layers
+    final class Transformer: Module {
+        @ModuleInfo(key: "layers") var layers: [EncoderLayer]
+
+        init(config: Magistral3Configuration.VisionConfiguration) {
+            self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map { _ in
+                EncoderLayer(config: config)
+            }
+        }
+    }
+
     // Complete vision model
     final class PixtralVisionModel: Module {
-        @ModuleInfo(key: "patch_embedding") var patchEmbed: PatchEmbeddings
-        @ModuleInfo(key: "layers") var layers: [EncoderLayer]
-        @ModuleInfo(key: "post_layernorm") var postLayerNorm: LayerNorm
+        @ModuleInfo(key: "patch_conv") var patchConv: Conv2dWrapper
+        @ModuleInfo(key: "transformer") var transformer: Transformer
+        @ModuleInfo(key: "ln_pre") var postLayerNorm: RMSNormWrapper
 
         let config: Magistral3Configuration.VisionConfiguration
         let rotaryEmbedding: VisionRotaryEmbedding
@@ -337,11 +454,15 @@ private enum Vision {
         init(_ config: Magistral3Configuration.VisionConfiguration) {
             self.config = config
 
-            self._patchEmbed.wrappedValue = PatchEmbeddings(config: config)
-            self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map { _ in
-                EncoderLayer(config: config)
-            }
-            self._postLayerNorm.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-5)
+            self._patchConv.wrappedValue = Conv2dWrapper(
+                inputChannels: config.numChannels,
+                outputChannels: config.hiddenSize,
+                kernelSize: IntOrPair(config.patchSize),
+                stride: IntOrPair(config.patchSize),
+                bias: false
+            )
+            self._transformer.wrappedValue = Transformer(config: config)
+            self._postLayerNorm.wrappedValue = RMSNormWrapper(dimensions: config.hiddenSize, eps: 1e-5)
 
             let headDim = config.headDim
             self.rotaryEmbedding = VisionRotaryEmbedding(dimension: headDim / 2, theta: config.ropeTheta)
@@ -349,7 +470,10 @@ private enum Vision {
 
         func callAsFunction(_ pixelValues: MLXArray) -> MLXArray {
             // pixelValues: [B, C, H, W]
-            var hiddenStates = patchEmbed(pixelValues)
+            // Apply patch convolution: [B, C, H, W] -> [B, hidden_size, H', W']
+            var hiddenStates = patchConv(pixelValues)
+            // Transpose to [B, H', W', hidden_size]
+            hiddenStates = hiddenStates.transposed(0, 2, 3, 1)
 
             // Flatten spatial dimensions
             let (B, H, W, D) = (hiddenStates.dim(0), hiddenStates.dim(1), hiddenStates.dim(2), hiddenStates.dim(3))
@@ -376,7 +500,7 @@ private enum Vision {
             let rotaryPosEmb = concatenated([hFreqs, wFreqs], axis: -1)
 
             // Apply transformer layers
-            for layer in layers {
+            for layer in transformer.layers {
                 hiddenStates = layer(hiddenStates, rotaryPosEmb: rotaryPosEmb)
             }
 
@@ -547,13 +671,13 @@ private enum Language {
 
     // Language model wrapper
     final class LanguageModel: Module, KVCacheDimensionProvider {
-        @ModuleInfo var model: Mistral3Model
+        @ModuleInfo(key: "model") var model: Mistral3Model
         @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
         var kvHeads: [Int]
 
         init(_ config: Magistral3Configuration.TextConfiguration) {
-            self.model = Mistral3Model(config)
+            self._model.wrappedValue = Mistral3Model(config)
 
             // Mistral3 typically uses tied embeddings, but check config
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
@@ -577,17 +701,51 @@ private enum Language {
 
 // MARK: - Multimodal Projector
 
-private class MultimodalProjector: Module {
-    @ModuleInfo(key: "linear") var linear: Linear
-    let activation: GELU
+private class PatchMerger: Module {
+    @ModuleInfo(key: "merging_layer") var mergingLayer: Linear
+    let spatialMergeSize: Int
 
-    init(visionHiddenSize: Int, textHiddenSize: Int, bias: Bool) {
-        self._linear.wrappedValue = Linear(visionHiddenSize, textHiddenSize, bias: bias)
-        self.activation = GELU()
+    init(hiddenSize: Int, spatialMergeSize: Int) {
+        self.spatialMergeSize = spatialMergeSize
+        self._mergingLayer.wrappedValue = Linear(
+            hiddenSize * spatialMergeSize * spatialMergeSize,
+            hiddenSize,
+            bias: false
+        )
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        activation(linear(x))
+    func callAsFunction(_ x: MLXArray, imageSizes: [IntOrPair]) -> MLXArray {
+        // For now, simple implementation - assumes already processed
+        // Full implementation would need unfold operation
+        mergingLayer(x)
+    }
+}
+
+private class MultimodalProjector: Module {
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+    @ModuleInfo(key: "patch_merger") var patchMerger: PatchMerger
+    @ModuleInfo(key: "linear_1") var linear1: Linear
+    let gelu: GELU
+    @ModuleInfo(key: "linear_2") var linear2: Linear
+
+    init(visionHiddenSize: Int, textHiddenSize: Int, spatialMergeSize: Int, bias: Bool) {
+        self._norm.wrappedValue = RMSNorm(dimensions: visionHiddenSize)
+        self._patchMerger.wrappedValue = PatchMerger(
+            hiddenSize: visionHiddenSize,
+            spatialMergeSize: spatialMergeSize
+        )
+        self._linear1.wrappedValue = Linear(visionHiddenSize, textHiddenSize, bias: bias)
+        self.gelu = GELU()
+        self._linear2.wrappedValue = Linear(textHiddenSize, textHiddenSize, bias: bias)
+    }
+
+    func callAsFunction(_ x: MLXArray, imageSizes: [IntOrPair]) -> MLXArray {
+        var h = norm(x)
+        h = patchMerger(h, imageSizes: imageSizes)
+        h = linear1(h)
+        h = gelu(h)
+        h = linear2(h)
+        return h
     }
 }
 
@@ -605,10 +763,6 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var headDim: MLX.IntOrPair { .init(config.textConfig.headDim) }
 
-    public var loraLayers: [Module] {
-        languageModel.model.layers
-    }
-
     public init(_ config: Magistral3Configuration) {
         self.config = config
         self._visionModel.wrappedValue = Vision.PixtralVisionModel(config.visionConfig)
@@ -616,6 +770,7 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
         self._multiModalProjector.wrappedValue = MultimodalProjector(
             visionHiddenSize: config.visionConfig.hiddenSize,
             textHiddenSize: config.textConfig.hiddenSize,
+            spatialMergeSize: config.spatialMergeSize,
             bias: config.multimodalProjectorBias
         )
     }
@@ -663,7 +818,9 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
         }
 
         // Project to text embedding space
-        visionFeatures = multiModalProjector(visionFeatures)
+        // TODO: Pass actual image sizes from input
+        let imageSizes: [IntOrPair] = []
+        visionFeatures = multiModalProjector(visionFeatures, imageSizes: imageSizes)
 
         // Get text embeddings
         let embeddings = languageModel.model.embedTokens(inputIds)
@@ -733,11 +890,41 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        // Remove unused precomputed rotary frequencies
-        weights.filter {
-            !$0.key.contains("self_attn.rotary_emb.inv_freq") &&
-            !$0.key.contains("rotary_emb.inv_freq")
+        // Keys to filter with contains check
+        let containsFilters = [
+            "self_attn.rotary_emb.inv_freq",
+            "rotary_emb.inv_freq"
+        ]
+
+        // Exact keys to filter (unqualified top-level keys that don't match our model structure)
+        let exactFilters: Set<String> = [
+            "layers", "norm", "output", "patch_merger", "pre_mm_projector_norm",
+            "tok_embeddings", "vision_encoder", "vision_language_adapter"
+        ]
+
+        var sanitized = weights.filter { key, _ in
+            // Filter out keys that contain certain strings
+            let hasContainsFilter = containsFilters.contains(where: { key.contains($0) })
+            // Filter out exact key matches
+            let isExactFilter = exactFilters.contains(key)
+
+            return !hasContainsFilter && !isExactFilter
         }
+
+        // Transpose patch_conv weights from PyTorch format [O, I, H, W] to MLX format [O, H, W, I]
+        if let patchConvWeight = sanitized["vision_tower.patch_conv.weight"] {
+            // Expected shape: [out_channels, in_channels, kernel_h, kernel_w]
+            // MLX wants: [out_channels, kernel_h, kernel_w, in_channels]
+            sanitized["vision_tower.patch_conv.weight"] = patchConvWeight.transposed(0, 2, 3, 1)
+        }
+
+        return sanitized
+    }
+}
+
+extension Magistral3ForConditionalGeneration: LoRAModel {
+    public var loraLayers: [Module] {
+        languageModel.model.layers
     }
 }
 
