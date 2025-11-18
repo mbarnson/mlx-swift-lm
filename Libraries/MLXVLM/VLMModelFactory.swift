@@ -92,6 +92,7 @@ public class VLMTypeRegistry: ModelTypeRegistry, @unchecked Sendable {
             // TODO: see if we can make it work with fastvlm rather than llava_qwen2
             "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
             "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
+            "mistral3": create(Magistral3Configuration.self, Magistral3ForConditionalGeneration.init),
         ]
     }
 }
@@ -123,6 +124,8 @@ public class VLMProcessorTypeRegistry: ProcessorTypeRegistry, @unchecked Sendabl
                 SmolVLMProcessorConfiguration.self, SmolVLMProcessor.init),
             "FastVLMProcessor": create(
                 FastVLMProcessorConfiguration.self, FastVLMProcessor.init),
+            "Magistral3Processor": create(
+                Magistral3ProcessorConfiguration.self, Magistral3Processor.init),
         ]
     }
 }
