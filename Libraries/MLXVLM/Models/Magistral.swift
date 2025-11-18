@@ -115,18 +115,47 @@ public struct Magistral3Configuration: Codable, Sendable {
 public struct Magistral3ProcessorConfiguration: Codable, Sendable {
 
     public struct Size: Codable, Sendable {
-        public let width: Int
-        public let height: Int
+        public let longestEdge: Int?
+        public let width: Int?
+        public let height: Int?
 
-        var cgSize: CGSize { .init(width: width, height: height) }
+        var cgSize: CGSize {
+            if let width = width, let height = height {
+                return .init(width: width, height: height)
+            } else if let edge = longestEdge {
+                return .init(width: edge, height: edge)
+            }
+            return .init(width: 1540, height: 1540)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case longestEdge = "longest_edge"
+            case width
+            case height
+        }
+    }
+
+    public struct PatchSize: Codable, Sendable {
+        public let width: Int?
+        public let height: Int?
+
+        var size: Int {
+            width ?? height ?? 14
+        }
     }
 
     public let imageMean: [CGFloat]
     public let imageStd: [CGFloat]
-    public let size: Size
-    public let patchSize: Int
-    public let spatialMergeSize: Int
-    public let imageTokenIndex: Int
+    public let size: Size?
+    public let patchSize: PatchSize?
+    // These fields come from model config.json, not preprocessor_config.json
+    private let _spatialMergeSize: Int?
+    private let _imageTokenIndex: Int?
+
+    public var spatialMergeSize: Int { _spatialMergeSize ?? 2 }
+    public var imageTokenIndex: Int { _imageTokenIndex ?? 10 }
+    public var actualPatchSize: Int { patchSize?.size ?? 14 }
+    public var actualSize: CGSize { size?.cgSize ?? .init(width: 1540, height: 1540) }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
@@ -141,8 +170,8 @@ public struct Magistral3ProcessorConfiguration: Codable, Sendable {
         case imageStd = "image_std"
         case size
         case patchSize = "patch_size"
-        case spatialMergeSize = "spatial_merge_size"
-        case imageTokenIndex = "image_token_index"
+        case _spatialMergeSize = "spatial_merge_size"
+        case _imageTokenIndex = "image_token_index"
     }
 
     // Default values if preprocessor_config.json is missing
@@ -150,10 +179,10 @@ public struct Magistral3ProcessorConfiguration: Codable, Sendable {
         // ImageNet normalization as default for Pixtral
         self.imageMean = [0.48145466, 0.4578275, 0.40821073]
         self.imageStd = [0.26862954, 0.26130258, 0.27577711]
-        self.size = Size(width: 1540, height: 1540)
-        self.patchSize = patchSize
-        self.spatialMergeSize = spatialMergeSize
-        self.imageTokenIndex = imageTokenIndex
+        self.size = nil
+        self.patchSize = nil
+        self._spatialMergeSize = spatialMergeSize
+        self._imageTokenIndex = imageTokenIndex
     }
 }
 
@@ -859,7 +888,7 @@ public final class Magistral3Processor: UserInputProcessor {
         processedImage = MediaProcessing.apply(processedImage, processing: processing)
 
         // Resize to target size
-        processedImage = MediaProcessing.resampleBicubic(processedImage, to: config.size.cgSize)
+        processedImage = MediaProcessing.resampleBicubic(processedImage, to: config.actualSize)
 
         // Normalize with ImageNet statistics
         processedImage = MediaProcessing.normalize(
@@ -894,8 +923,8 @@ public final class Magistral3Processor: UserInputProcessor {
         let pixels = try preprocessImage(input.images[0].asCIImage(), processing: input.processing)
 
         // Calculate number of image tokens after spatial merging
-        let imageSize = config.size.width
-        let patchSize = config.patchSize
+        let imageSize = Int(config.actualSize.width)
+        let patchSize = config.actualPatchSize
         let spatialMergeSize = config.spatialMergeSize
         let patchesPerSide = imageSize / patchSize
         let mergedPatchesPerSide = patchesPerSide / spatialMergeSize

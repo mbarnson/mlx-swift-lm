@@ -126,6 +126,9 @@ public class VLMProcessorTypeRegistry: ProcessorTypeRegistry, @unchecked Sendabl
                 FastVLMProcessorConfiguration.self, FastVLMProcessor.init),
             "Magistral3Processor": create(
                 Magistral3ProcessorConfiguration.self, Magistral3Processor.init),
+            // Alias for Magistral3/Pixtral models (preprocessor_config.json uses "PixtralProcessor")
+            "PixtralProcessor": create(
+                Magistral3ProcessorConfiguration.self, Magistral3Processor.init),
         ]
     }
 }
