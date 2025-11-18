@@ -124,6 +124,9 @@ public struct Magistral3ProcessorConfiguration: Codable, Sendable {
     public let imageMean: [CGFloat]
     public let imageStd: [CGFloat]
     public let size: Size
+    public let patchSize: Int
+    public let spatialMergeSize: Int
+    public let imageTokenIndex: Int
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
         (imageMean[0], imageMean[1], imageMean[2])
@@ -137,14 +140,20 @@ public struct Magistral3ProcessorConfiguration: Codable, Sendable {
         case imageMean = "image_mean"
         case imageStd = "image_std"
         case size
+        case patchSize = "patch_size"
+        case spatialMergeSize = "spatial_merge_size"
+        case imageTokenIndex = "image_token_index"
     }
 
     // Default values if preprocessor_config.json is missing
-    public init() {
+    public init(patchSize: Int = 14, spatialMergeSize: Int = 2, imageTokenIndex: Int = 10) {
         // ImageNet normalization as default for Pixtral
         self.imageMean = [0.48145466, 0.4578275, 0.40821073]
         self.imageStd = [0.26862954, 0.26130258, 0.27577711]
         self.size = Size(width: 1540, height: 1540)
+        self.patchSize = patchSize
+        self.spatialMergeSize = spatialMergeSize
+        self.imageTokenIndex = imageTokenIndex
     }
 }
 
@@ -499,7 +508,7 @@ private enum Language {
     final class Mistral3Model: Module {
         @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-        let layers: [DecoderLayer]
+        @ModuleInfo(key: "layers") var layers: [DecoderLayer]
         let norm: RMSNorm
 
         init(_ config: Magistral3Configuration.TextConfiguration) {
@@ -657,31 +666,50 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
         visionFeatures = multiModalProjector(visionFeatures)
 
         // Get text embeddings
-        var embeddings = languageModel.model.embedTokens(inputIds)
+        let embeddings = languageModel.model.embedTokens(inputIds)
 
-        // Replace image tokens with vision features
-        // This is a simplified version - in production you'd want more sophisticated merging
+        // Replace image tokens with vision features following Idefics3 pattern
+        // Assumes batch size == 1
+        // asArray returns multi-dimensional array matching input shape
+        let allIds = inputIds.asArray(Int.self)
+        guard let inputIdArray = allIds.first else {
+            return embeddings
+        }
         let imageTokenId = config.imageTokenIndex
 
-        // For each batch item, replace image token positions with vision features
-        // Note: This assumes image tokens are placed contiguously in the prompt
-        let B = inputIds.dim(0)
-        let numImageTokens = visionFeatures.dim(1)
-
-        // Find first occurrence of image token and replace with vision features
-        for b in 0..<B {
-            let tokenIds = inputIds[b].asArray(Int32.self)
-            var imageFeatureIdx = 0
-
-            for i in 0..<tokenIds.count {
-                if Int(tokenIds[i]) == imageTokenId && imageFeatureIdx < numImageTokens {
-                    embeddings[b, i, 0...] = visionFeatures[b, imageFeatureIdx, 0...]
-                    imageFeatureIdx += 1
-                }
-            }
+        // Find all positions where image tokens occur
+        let imagePositions = inputIdArray.enumerated().compactMap {
+            $1 == imageTokenId ? $0 : nil
         }
 
-        return embeddings
+        // Build final embeddings by concatenating text and vision segments
+        var segments = [MLXArray]()
+        var startIdx = 0
+
+        // Vision features: (B=1, num_patches, hidden_size)
+        let numVisionTokens = visionFeatures.dim(1)
+
+        for (visionIdx, pos) in imagePositions.enumerated() {
+            // Add text embeddings before this image token
+            if pos > startIdx {
+                segments.append(embeddings[0, startIdx..<pos])
+            }
+
+            // Add vision feature for this position
+            if visionIdx < numVisionTokens {
+                segments.append(visionFeatures[0, visionIdx..<visionIdx + 1])
+            }
+
+            startIdx = pos + 1
+        }
+
+        // Add remaining text embeddings after last image token
+        if startIdx < embeddings.dim(1) {
+            segments.append(embeddings[0, startIdx...])
+        }
+
+        let finalEmbeddings = concatenated(segments, axis: 0)
+        return finalEmbeddings.expandedDimensions(axis: 0)
     }
 
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
@@ -774,25 +802,24 @@ public final class Magistral3Processor: UserInputProcessor {
 
         // Calculate number of image tokens after spatial merging
         let imageSize = config.size.width
-        let patchSize = 14  // From vision config
-        let spatialMergeSize = 2  // From model config
+        let patchSize = config.patchSize
+        let spatialMergeSize = config.spatialMergeSize
         let patchesPerSide = imageSize / patchSize
         let mergedPatchesPerSide = patchesPerSide / spatialMergeSize
         let numImageTokens = mergedPatchesPerSide * mergedPatchesPerSide
 
-        // Insert image tokens into the prompt
-        // Find <image> placeholder or insert at beginning
-        let imageToken = "<image>"
-        let imageTokenString = String(repeating: imageToken, count: numImageTokens)
+        // Insert image tokens by replacing image token index with actual tokens
+        var tokenIds = promptTokens
+        let imageTokenId = config.imageTokenIndex
 
-        // For now, insert image tokens at the beginning of the first user message
-        // A more sophisticated approach would parse the chat template
-        var modifiedPrompt = promptTokens
+        // Find the image token and replace it with the correct number of image tokens
+        if let imageTokenIdx = tokenIds.firstIndex(of: imageTokenId) {
+            // Replace single image token with numImageTokens copies
+            tokenIds.remove(at: imageTokenIdx)
+            tokenIds.insert(contentsOf: Array(repeating: imageTokenId, count: numImageTokens), at: imageTokenIdx)
+        }
 
-        // Re-encode with image tokens
-        // This is a simplified version - a full implementation would need to handle
-        // the chat template's image token placement correctly
-        let promptArray = MLXArray(modifiedPrompt).expandedDimensions(axis: 0)
+        let promptArray = MLXArray(tokenIds).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
         return LMInput(
