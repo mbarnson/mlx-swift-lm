@@ -238,7 +238,7 @@ private enum Vision {
 
     // Patch embeddings for vision transformer
     final class PatchEmbeddings: Module, UnaryLayer {
-        @ModuleInfo(key: "patch_embedding") var patchEmbedding: Conv2d
+        @ModuleInfo(key: "patch_conv") var patchEmbedding: Conv2d
 
         let patchSize: Int
         let hiddenSize: Int
@@ -840,7 +840,7 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
             "tok_embeddings", "vision_encoder", "vision_language_adapter"
         ]
 
-        var sanitized = weights.filter { key, _ in
+        let sanitized = weights.filter { key, _ in
             // Filter out keys that contain certain strings
             let hasContainsFilter = containsFilters.contains(where: { key.contains($0) })
             // Filter out exact key matches
@@ -849,12 +849,9 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
             return !hasContainsFilter && !isExactFilter
         }
 
-        // Transpose patch_conv weights from PyTorch format [O, I, H, W] to MLX format [O, H, W, I]
-        if let patchConvWeight = sanitized["vision_tower.vision_model.vision_model.patch_conv.weight"] {
-            // Expected shape: [out_channels, in_channels, kernel_h, kernel_w]
-            // MLX wants: [out_channels, kernel_h, kernel_w, in_channels]
-            sanitized["vision_tower.vision_model.vision_model.patch_conv.weight"] = patchConvWeight.transposed(0, 2, 3, 1)
-        }
+        // Note: MLX-converted models already have patch_conv weights in correct format [O, H, W, I]
+        // The key is vision_tower.vision_model.patch_conv.weight (not vision_tower.vision_model.vision_model.patch_conv.weight)
+        // No transposition needed for MLX-format models
 
         return sanitized
     }
