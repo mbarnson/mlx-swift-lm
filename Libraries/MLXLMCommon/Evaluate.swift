@@ -397,10 +397,24 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
         // process the logits (one hot array of possible tokens)
         var logits = logits[0..., -1, 0...]
+
+        // DEBUG: Log raw logits before processing
+        print("🔍 DEBUG convertToToken: Raw logits shape: \(logits.shape)")
+        let logitsArray = logits.asArray(Float.self)
+        let maxLogit = logitsArray.max() ?? 0
+        let minLogit = logitsArray.min() ?? 0
+        let avgLogit = logitsArray.reduce(0, +) / Float(logitsArray.count)
+        print("🔍 DEBUG convertToToken: Logits stats - max: \(maxLogit), min: \(minLogit), avg: \(avgLogit)")
+        print("🔍 DEBUG convertToToken: First 10 logits: \(Array(logitsArray.prefix(10)))")
+
         logits = processor?.process(logits: logits) ?? logits
 
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
+
+        // DEBUG: Log sampled token
+        let tokenId = y.item(Int.self)
+        print("🔍 DEBUG convertToToken: Sampled token ID: \(tokenId)")
 
         processor?.didSample(token: y)
 
@@ -409,9 +423,16 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
+        // DEBUG: Log input
+        print("🔍 DEBUG step: Input tokens shape: \(previous.tokens.shape)")
+        print("🔍 DEBUG step: Cache length: \(cache.first?.offset ?? 0)")
+
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
+
+        // DEBUG: Log output logits
+        print("🔍 DEBUG step: Output logits shape: \(result.logits.shape)")
 
         // Apply dynamic cache quantization after each step
         maybeQuantizeKVCache(

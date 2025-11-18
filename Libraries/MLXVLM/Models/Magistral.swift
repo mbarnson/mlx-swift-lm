@@ -221,49 +221,31 @@ private enum Vision {
     }
 
     static func applyRotary(_ tensor: MLXArray, freqs: MLXArray) -> MLXArray {
+        print("🔍 DEBUG applyRotary: tensor shape: \(tensor.shape), freqs shape: \(freqs.shape)")
+
         var cosVals = cos(freqs)
         var sinVals = sin(freqs)
 
-        cosVals = expandedDimensions(cosVals, axis: 1)
-        cosVals = tiled(cosVals, repetitions: [1, 1, 2])
-        cosVals = expandedDimensions(cosVals, axis: 0)
+        // freqs is [seq_len, head_dim/2], need to broadcast to [B, num_heads, seq_len, head_dim]
+        // tensor is [B, num_heads, seq_len, head_dim]
+        cosVals = expandedDimensions(cosVals, axis: 1)  // [seq_len, 1, head_dim/2]
+        cosVals = tiled(cosVals, repetitions: [1, 1, 2])  // [seq_len, 1, head_dim]
+        cosVals = cosVals.squeezed(axis: 1)  // [seq_len, head_dim]
+        cosVals = expandedDimensions(cosVals, axes: [0, 1])  // [1, 1, seq_len, head_dim]
 
-        sinVals = expandedDimensions(sinVals, axis: 1)
-        sinVals = tiled(sinVals, repetitions: [1, 1, 2])
-        sinVals = expandedDimensions(sinVals, axis: 0)
+        print("🔍 DEBUG applyRotary: cosVals shape after transform: \(cosVals.shape)")
+
+        sinVals = expandedDimensions(sinVals, axis: 1)  // [seq_len, 1, head_dim/2]
+        sinVals = tiled(sinVals, repetitions: [1, 1, 2])  // [seq_len, 1, head_dim]
+        sinVals = sinVals.squeezed(axis: 1)  // [seq_len, head_dim]
+        sinVals = expandedDimensions(sinVals, axes: [0, 1])  // [1, 1, seq_len, head_dim]
+
+        // CRITICAL FIX: Evaluate cos/sin transformations to prevent exponential graph growth
+        // Without this, the lazy computation graph grows with each layer, causing infinite hang
+        eval(cosVals, sinVals)
 
         let rotated = (tensor * cosVals) + (rotateHalf(tensor) * sinVals)
         return rotated.asType(tensor.dtype)
-    }
-
-    // Patch embeddings for vision transformer
-    final class PatchEmbeddings: Module, UnaryLayer {
-        @ModuleInfo(key: "patch_conv") var patchEmbedding: Conv2d
-
-        let patchSize: Int
-        let hiddenSize: Int
-
-        init(config: Magistral3Configuration.VisionConfiguration) {
-            self.patchSize = config.patchSize
-            self.hiddenSize = config.hiddenSize
-
-            self._patchEmbedding.wrappedValue = Conv2d(
-                inputChannels: config.numChannels,
-                outputChannels: config.hiddenSize,
-                kernelSize: IntOrPair(config.patchSize),
-                stride: IntOrPair(config.patchSize),
-                bias: false
-            )
-        }
-
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            // x shape: [B, C, H, W]
-            // output shape: [B, num_patches_h, num_patches_w, hidden_size]
-            var patches = patchEmbedding(x)
-            // Conv2d output is [B, hidden_size, H', W'], need to transpose
-            patches = patches.transposed(0, 2, 3, 1)
-            return patches
-        }
     }
 
     // Vision attention module
@@ -394,11 +376,22 @@ private enum Vision {
         }
 
         func callAsFunction(_ pixelValues: MLXArray) -> MLXArray {
-            // pixelValues: [B, C, H, W]
-            // Apply patch convolution: [B, C, H, W] -> [B, hidden_size, H', W']
-            var hiddenStates = patchConv(pixelValues)
-            // Transpose to [B, H', W', hidden_size]
-            hiddenStates = hiddenStates.transposed(0, 2, 3, 1)
+            // pixelValues: [B, H, W, C] (MLX channels-last format)
+            // Apply patch convolution: [B, H, W, C] -> [B, H', W', hidden_size]
+
+            // DEBUG: Log shapes before convolution
+            print("🔍 DEBUG: pixelValues shape: \(pixelValues.shape)")
+            print("🔍 DEBUG: patchConv.weight shape: \(patchConv.weight.shape)")
+            print("🔍 DEBUG: patchConv.weight ndim: \(patchConv.weight.ndim)")
+
+            // Reshape from [B, num_images, C, H, W] to [B, H, W, C] (channels-last for MLX Conv2d)
+            // pixelValues is [1, 1, 3, 1540, 1540], need [1, 1540, 1540, 3]
+            let reshapedInput = pixelValues.squeezed(axis: 1)  // [1, 3, 1540, 1540]
+            let channelsLast = reshapedInput.transposed(0, 2, 3, 1)  // [1, 1540, 1540, 3]
+            print("🔍 DEBUG: channels-last input shape: \(channelsLast.shape)")
+
+            var hiddenStates = patchConv(channelsLast)
+            // Already in channels-last format [B, H', W', hidden_size]
 
             // Flatten spatial dimensions
             let (B, H, W, D) = (hiddenStates.dim(0), hiddenStates.dim(1), hiddenStates.dim(2), hiddenStates.dim(3))
@@ -425,11 +418,15 @@ private enum Vision {
             let rotaryPosEmb = concatenated([hFreqs, wFreqs], axis: -1)
 
             // Apply transformer layers
+            // CRITICAL FIX: Evaluate after each layer to prevent exponential graph growth
+            // Without this, each layer builds on an unevaluated graph, causing massive memory usage
             for layer in transformer.layers {
                 hiddenStates = layer(hiddenStates, rotaryPosEmb: rotaryPosEmb)
+                eval(hiddenStates)
             }
 
             hiddenStates = postLayerNorm(hiddenStates)
+            eval(hiddenStates)
 
             return hiddenStates
         }
@@ -653,9 +650,47 @@ private class PatchMerger: Module {
     }
 
     func callAsFunction(_ x: MLXArray, imageSizes: [IntOrPair]) -> MLXArray {
-        // For now, simple implementation - assumes already processed
-        // Full implementation would need unfold operation
-        mergingLayer(x)
+        // x shape: [B, num_patches, hidden_size]
+        // imageSizes: array of (height, width) for each image
+
+        let (B, numPatches, hiddenSize) = (x.dim(0), x.dim(1), x.dim(2))
+
+        // Calculate grid size (assuming square grid)
+        let gridSize = Int(sqrt(Double(numPatches)))
+        guard gridSize * gridSize == numPatches else {
+            // Not a perfect square, can't merge
+            print("🔍 DEBUG PatchMerger: not square (\(numPatches) patches), returning as-is")
+            return x
+        }
+
+        // Reshape to grid: [B, H, W, hidden_size]
+        var patches = x.reshaped(B, gridSize, gridSize, hiddenSize)
+
+        // Merge spatialMergeSize x spatialMergeSize patches
+        let mergedGridSize = gridSize / spatialMergeSize
+        guard mergedGridSize > 0 else {
+            print("🔍 DEBUG PatchMerger: mergedGridSize <= 0, returning as-is")
+            return x
+        }
+
+        // Reshape to [B, mergedH, mergeSize, mergedW, mergeSize, hidden_size]
+        patches = patches.reshaped(
+            B, mergedGridSize, spatialMergeSize, mergedGridSize, spatialMergeSize, hiddenSize
+        )
+
+        // Transpose to [B, mergedH, mergedW, mergeSize, mergeSize, hidden_size]
+        patches = patches.transposed(0, 1, 3, 2, 4, 5)
+
+        // Flatten merge dimensions: [B, mergedH*mergedW, mergeSize*mergeSize*hidden_size]
+        let numMergedPatches = mergedGridSize * mergedGridSize
+        patches = patches.reshaped(B, numMergedPatches, spatialMergeSize * spatialMergeSize * hiddenSize)
+
+        // Project through linear layer to reduce back to hidden_size
+        let merged = mergingLayer(patches)
+
+        print("🔍 DEBUG PatchMerger: \(gridSize)x\(gridSize) -> \(mergedGridSize)x\(mergedGridSize) (\(numPatches) -> \(numMergedPatches) patches)")
+
+        return merged
     }
 }
 
@@ -667,6 +702,8 @@ private class MultimodalProjector: Module {
     @ModuleInfo(key: "linear_2") var linear2: Linear
 
     init(visionHiddenSize: Int, textHiddenSize: Int, spatialMergeSize: Int, bias: Bool) {
+        // Python implementation uses visionHiddenSize for all dimensions
+        // PatchMerger handles the spatial merging AND dimension reduction internally
         self._norm.wrappedValue = RMSNorm(dimensions: visionHiddenSize)
         self._patchMerger.wrappedValue = PatchMerger(
             hiddenSize: visionHiddenSize,
@@ -750,15 +787,19 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
         // Extract vision features
         var visionFeatures = visionModel(pixelValues)
 
-        // Apply spatial merging
-        if config.spatialMergeSize > 1 {
-            visionFeatures = mergeSpatialPatches(visionFeatures, mergeSize: config.spatialMergeSize)
-        }
+        // Extract image sizes from pixelValues shape: [batch, num_images, channels, height, width]
+        // For now, assume single image: pixelValues shape is [1, 1, 3, H, W]
+        let imageHeight = pixelValues.shape[3]
+        let imageWidth = pixelValues.shape[4]
+        let imageSizes: [IntOrPair] = [IntOrPair((imageHeight, imageWidth))]
 
         // Project to text embedding space
-        // TODO: Pass actual image sizes from input
-        let imageSizes: [IntOrPair] = []
+        // PatchMerger inside MultimodalProjector will handle spatial merging
         visionFeatures = multiModalProjector(visionFeatures, imageSizes: imageSizes)
+
+        // CRITICAL FIX: Evaluate projected features before token replacement
+        // This ensures the vision processing is complete before we try to access inputIds
+        eval(visionFeatures)
 
         // Get text embeddings
         let embeddings = languageModel.model.embedTokens(inputIds)
@@ -781,16 +822,16 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
         // Vision features: (B=1, num_patches, hidden_size)
         let numVisionTokens = visionFeatures.dim(1)
 
-        for (visionIdx, pos) in imagePositions.enumerated() {
+        for (_, pos) in imagePositions.enumerated() {
             // Add text embeddings before this image token
             if pos > startIdx {
                 segments.append(embeddings[0, startIdx..<pos])
             }
 
-            // Add vision feature for this position
-            if visionIdx < numVisionTokens {
-                segments.append(visionFeatures[0, visionIdx..<visionIdx + 1])
-            }
+            // Add ALL vision features at this image token position
+            // visionFeatures shape: [1, num_patches, hidden_size]
+            // We need to insert all patches (not just one!)
+            segments.append(visionFeatures[0])  // Add all vision patches: [num_patches, hidden_size]
 
             startIdx = pos + 1
         }
@@ -800,26 +841,48 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
             segments.append(embeddings[0, startIdx...])
         }
 
-        let finalEmbeddings = concatenated(segments, axis: 0)
-        return finalEmbeddings.expandedDimensions(axis: 0)
+        // Concatenate along the sequence dimension (axis 0 of each segment)
+        // Each segment is [seq_len, hidden_size], we want to stack them into one sequence
+        let finalEmbeddings = concatenated(segments, axis: 0)  // Concatenates sequences together
+        let result = finalEmbeddings.expandedDimensions(axis: 0)  // Add batch dim: [1, total_seq_len, hidden_size]
+
+        print("🔍 DEBUG inputEmbeddings: finalEmbeddings shape: \(finalEmbeddings.shape)")
+        print("🔍 DEBUG inputEmbeddings: result shape: \(result.shape)")
+        print("🔍 DEBUG inputEmbeddings: num segments: \(segments.count)")
+        for (idx, seg) in segments.enumerated() {
+            print("🔍   segment[\(idx)] shape: \(seg.shape)")
+        }
+
+        return result
     }
 
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        guard let image = input.image else {
-            // Text-only inference
-            let result = languageModel(input.text.tokens, cache: cache)
+        // For vision models, we need to determine if this is the first call (with image)
+        // or a subsequent generation call (text-only).
+        // The key insight: on the first call, the cache is empty. On subsequent calls,
+        // the cache contains the KV states from previous tokens (including vision tokens).
+
+        // Check cache length to determine if this is first call
+        let cacheLength = cache.first?.offset ?? 0
+        let isFirstCall = cacheLength == 0
+
+        // Only process vision on the first call when image is present
+        if let image = input.image, isFirstCall {
+            // First call with image: Process vision + text
+            let inputIds = input.text.tokens
+            let pixelValues = image.pixels
+
+            let inputEmbedding = inputEmbeddings(inputIds: inputIds, pixelValues: pixelValues)
+
+            let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbedding)
+
             return .logits(result)
         }
 
-        let inputIds = input.text.tokens
-        let pixelValues = image.pixels
-
-        let inputEmbedding = inputEmbeddings(inputIds: inputIds, pixelValues: pixelValues)
-
-        let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbedding)
-
+        // Text-only path: either no image, or subsequent generation steps
+        let result = languageModel(input.text.tokens, cache: cache)
         return .logits(result)
     }
 
@@ -899,10 +962,56 @@ public final class Magistral3Processor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         // Generate messages from input
-        let messages = DefaultMessageGenerator().generate(from: input)
+        let rawMessages = DefaultMessageGenerator().generate(from: input)
+
+        // For Magistral/Pixtral models, we need to ensure image content blocks come BEFORE text
+        // in the message content. The chat template preserves the order we give it.
+        // Python mlx_vlm generates prompts like "[INST][IMG]What color is this?[/INST]"
+        // but our default implementation generates "[INST]What color is this?[IMG][/INST]"
+        // We need to reorder the content array to match Python's order.
+        var messages: [Message] = []
+        for rawMessage in rawMessages {
+            var message = rawMessage
+
+            // Only reformat user messages with images
+            // The content field is an array of dictionaries: [["type": "text", "text": "..."], ["type": "image"]]
+            if let contentArray = message["content"] as? [[String: Any]],
+               !input.images.isEmpty {
+                // Separate text and image content blocks
+                var textBlocks: [[String: Any]] = []
+                var imageBlocks: [[String: Any]] = []
+
+                for block in contentArray {
+                    if let type = block["type"] as? String {
+                        if type == "image" {
+                            imageBlocks.append(block)
+                        } else {
+                            textBlocks.append(block)
+                        }
+                    }
+                }
+
+                // Reorder: image blocks FIRST, then text blocks
+                message["content"] = imageBlocks + textBlocks
+            }
+
+            messages.append(message)
+        }
 
         // Apply chat template
         let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+
+        // DEBUG: Decode and print the generated prompt
+        let promptText = tokenizer.decode(tokens: promptTokens)
+        print("🔍 DEBUG Magistral.prepare(): Reformatted messages:", messages.map { m in
+            if let content = m["content"] as? String, let role = m["role"] as? String {
+                return "[\(role)]: \(content.prefix(100))"
+            }
+            return String(describing: m)
+        }.joined(separator: "\n"))
+        print("🔍 DEBUG Magistral.prepare(): Prompt text (first 200 chars): \(String(promptText.prefix(200)))")
+        print("🔍 DEBUG Magistral.prepare(): Prompt tokens count: \(promptTokens.count)")
+        print("🔍 DEBUG Magistral.prepare(): Prompt token IDs (first 20): \(Array(promptTokens.prefix(20)))")
 
         if input.images.isEmpty {
             // Text-only mode
@@ -919,26 +1028,12 @@ public final class Magistral3Processor: UserInputProcessor {
         // Preprocess image
         let pixels = try preprocessImage(input.images[0].asCIImage(), processing: input.processing)
 
-        // Calculate number of image tokens after spatial merging
-        let imageSize = Int(config.actualSize.width)
-        let patchSize = config.actualPatchSize
-        let spatialMergeSize = config.spatialMergeSize
-        let patchesPerSide = imageSize / patchSize
-        let mergedPatchesPerSide = patchesPerSide / spatialMergeSize
-        let numImageTokens = mergedPatchesPerSide * mergedPatchesPerSide
+        // CRITICAL: Do NOT expand the image token here!
+        // The model's inputEmbeddings() function will replace the single [IMG] token
+        // with ALL vision features. Expanding it here causes exponential memory explosion.
+        // The tokenizer already inserted ONE image token via chat template.
 
-        // Insert image tokens by replacing image token index with actual tokens
-        var tokenIds = promptTokens
-        let imageTokenId = config.imageTokenIndex
-
-        // Find the image token and replace it with the correct number of image tokens
-        if let imageTokenIdx = tokenIds.firstIndex(of: imageTokenId) {
-            // Replace single image token with numImageTokens copies
-            tokenIds.remove(at: imageTokenIdx)
-            tokenIds.insert(contentsOf: Array(repeating: imageTokenId, count: numImageTokens), at: imageTokenIdx)
-        }
-
-        let promptArray = MLXArray(tokenIds).expandedDimensions(axis: 0)
+        let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
         return LMInput(
