@@ -999,7 +999,26 @@ public final class Magistral3Processor: UserInputProcessor {
         }
 
         // Apply chat template
-        let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+
+        // CRITICAL FIX: swift-transformers applyChatTemplate doesn't handle image content blocks.
+        // The Jinja template should insert [IMG] (token ID 10) for {"type": "image"} blocks,
+        // but applyChatTemplate skips them. We must manually insert the image token.
+        if !input.images.isEmpty {
+            // Find the [INST] token ID (should be token 3 based on tokenizer config)
+            let instTokenText = "[INST]"
+            let instTokenId = tokenizer.convertTokenToId(instTokenText) ?? 3
+
+            // Find where [INST] appears in the token sequence
+            if let instIndex = promptTokens.firstIndex(of: instTokenId) {
+                // Insert [IMG] token (ID 10) right after [INST]
+                let imageTokenId = config.imageTokenIndex  // Should be 10
+                promptTokens.insert(imageTokenId, at: instIndex + 1)
+                print("🔍 DEBUG Magistral.prepare(): Inserted image token (\(imageTokenId)) at position \(instIndex + 1)")
+            } else {
+                print("⚠️  WARNING: Could not find [INST] token to insert image token!")
+            }
+        }
 
         // DEBUG: Decode and print the generated prompt
         let promptText = tokenizer.decode(tokens: promptTokens)

@@ -375,6 +375,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        print("🔍 DEBUG prepare: input.text.tokens shape: \(input.text.tokens.shape)")
         processor?.prompt(input.text.tokens)
 
         switch try model.prepare(input, cache: cache, windowSize: windowSize) {
@@ -407,7 +408,13 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         print("🔍 DEBUG convertToToken: Logits stats - max: \(maxLogit), min: \(minLogit), avg: \(avgLogit)")
         print("🔍 DEBUG convertToToken: First 10 logits: \(Array(logitsArray.prefix(10)))")
 
-        logits = processor?.process(logits: logits) ?? logits
+        // DEBUG: Check if processor exists
+        if let processor = processor {
+            print("🔍 DEBUG convertToToken: Processor EXISTS (type: \(type(of: processor)))")
+            logits = processor.process(logits: logits)
+        } else {
+            print("⚠️  DEBUG convertToToken: NO PROCESSOR - repetition penalty NOT applied!")
+        }
 
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
