@@ -509,7 +509,7 @@ private enum Language {
         @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
         @ModuleInfo(key: "layers") var layers: [DecoderLayer]
-        let norm: RMSNorm
+        @ModuleInfo(key: "norm") var norm: RMSNorm
 
         init(_ config: Magistral3Configuration.TextConfiguration) {
             precondition(config.vocabSize > 0)
@@ -517,10 +517,10 @@ private enum Language {
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
 
-            self.layers = (0 ..< config.numHiddenLayers).map { _ in
+            self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map { _ in
                 DecoderLayer(config)
             }
-            self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         }
 
         func callAsFunction(
@@ -670,16 +670,13 @@ public class Magistral3ForConditionalGeneration: Module, VLMModel, KVCacheDimens
 
         // Replace image tokens with vision features following Idefics3 pattern
         // Assumes batch size == 1
-        // asArray returns multi-dimensional array matching input shape
+        // asArray returns a flat 1D array - inputIds [1, seq_len] -> [seq_len] values
         let allIds = inputIds.asArray(Int.self)
-        guard let inputIdArray = allIds.first else {
-            return embeddings
-        }
         let imageTokenId = config.imageTokenIndex
 
         // Find all positions where image tokens occur
-        let imagePositions = inputIdArray.enumerated().compactMap {
-            $1 == imageTokenId ? $0 : nil
+        let imagePositions = allIds.enumerated().compactMap { idx, tokenId in
+            tokenId == imageTokenId ? idx : nil
         }
 
         // Build final embeddings by concatenating text and vision segments
@@ -783,7 +780,7 @@ public final class Magistral3Processor: UserInputProcessor {
         let messages = DefaultMessageGenerator().generate(from: input)
 
         // Apply chat template
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
 
         if input.images.isEmpty {
             // Text-only mode
